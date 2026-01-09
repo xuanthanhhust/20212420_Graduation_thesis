@@ -1,0 +1,335 @@
+import os
+import csv
+from pathlib import Path
+from tqdm import tqdm
+import numpy as np
+import torch
+import torch.nn as nn
+import torchvision
+import torch_pruning as tp
+from torchvision import transforms
+from torch.utils.data import DataLoader
+from thop import profile
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.metrics import f1_score
+from Class_Model import MyModule
+from Class_Dataset import MyDataset
+
+# =========================
+# Config
+# =========================
+DATA_ROOT_PATH = Path("E:/ECG_Thanh/ECG-compact-model-/ECG_Classification/data")
+MODEL_PATH = Path("E:/ECG_Thanh/ECG-compact-model-/ECG_Classification/model_save/ecg_model.pth")
+OUT_DIR = Path("E:/ECG_Thanh/ECG-compact-model-/ECG_Classification/prune_results")
+OUT_DIR.mkdir(parents=True, exist_ok=True)
+
+BATCH_SIZE = 128
+FINE_TUNE_EPOCHS = 5       # theo yêu cầu
+LEARNING_RATE = 1e-3
+PRUNE_RATIOS = [round(x, 1) for x in np.arange(0.1, 1.0, 0.1)]  # 0.1 ... 0.9
+BASELINE_ACC = 0.9944      # 99.44% → dùng dạng số thập phân
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# =========================
+# Dataloader
+# =========================
+transform = transforms.Compose([
+    transforms.Resize((100, 100)),
+    transforms.ToTensor()
+])
+
+train_dataset = MyDataset(root_dir=DATA_ROOT_PATH/'train_images', transform=transform)
+train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=0, pin_memory=True)
+
+test_dataset = MyDataset(root_dir=DATA_ROOT_PATH/'test_images', transform=transform)
+test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=0, pin_memory=True)
+
+
+# =========================
+# Utils: Evaluate FLOPs / Size / Accuracy
+# =========================
+def evaluate_model(model, input_shape=(1, 100, 100)):
+    model.eval()
+    with torch.no_grad():
+        input_tensor = torch.randn(1, *input_shape).to(device)
+        flops, params = profile(model, inputs=(input_tensor,))
+
+    # Model size (MB)
+    param_size = sum(p.numel() * p.element_size() for p in model.parameters())
+    buffer_size = sum(b.numel() * b.element_size() for b in model.buffers())
+    model_size = (param_size + buffer_size) / (1024 ** 2)
+    return flops, params, model_size
+
+
+@torch.no_grad()
+def eval_metrics(model, dataloader):
+    """
+    Trả về: accuracy, f1_macro, f1_weighted
+    """
+    model.eval()
+    correct, total = 0, 0
+    all_preds, all_labels = [], []
+    for inputs, targets in dataloader:
+        inputs, targets = inputs.to(device), targets.to(device)
+        outputs = model(inputs)
+        pred = outputs.argmax(dim=1)
+        correct += (pred == targets).sum().item()
+        total += targets.size(0)
+        all_preds.extend(pred.cpu().numpy().tolist())
+        all_labels.extend(targets.cpu().numpy().tolist())
+
+    acc = (correct / total) if total > 0 else 0.0
+    # F1 cho phân lớp đa lớp:
+    f1_macro = f1_score(all_labels, all_preds, average='macro') if total > 0 else 0.0
+    f1_weighted = f1_score(all_labels, all_preds, average='weighted') if total > 0 else 0.0
+    return acc, f1_macro, f1_weighted
+
+
+
+# =========================
+# EfficientNet-B0: Lấy tham chiếu đến kiến trúc gốc và phân stage
+# =========================
+def get_effnet_core(model):
+    """
+    Trả về object kiến trúc EfficientNet trị liệu:
+      - Nếu anh bọc trong MyModule với .model → lấy model.model
+      - Nếu load trực tiếp EfficientNet → trả về chính nó
+    """
+    return getattr(model, "model", model)
+
+def map_stages_efficientnet_b0(effnet):
+    """
+    Trả về dict: { stage_name: [module_instances_to_prune] }
+    Dựa trên torchvision EfficientNet-B0:
+    - effnet.features là Sequential gồm:
+      0: Stem (Conv2dNormActivation)
+      1: MBConv1 (k3)
+      2-3: MBConv6 (k3)
+      4-5: MBConv6 (k5)
+      6-8: MBConv6 (k3)
+      9-11: MBConv6 (k5)
+      12-15: MBConv6 (k5)
+      16: MBConv6 (k3)
+      17: Conv2dNormActivation (1x1 head)
+    - effnet.classifier: [Dropout?, Linear]
+    - effnet.avgpool: AdaptiveAvgPool2d(1)
+    """
+    stages = {}
+
+    # Helper: lấy các module prunable (Conv2d & Linear) trong một khối
+    def prunable_layers_of(module):
+        layers = []
+        for m in module.modules():
+            if isinstance(m, (nn.Conv2d, nn.Linear)):
+                layers.append(m)
+        return layers
+
+    features = effnet.features  # Sequential
+    # Stage 0: Stem (Conv 3x3)
+    stages["0_Stem_Conv3x3"] = prunable_layers_of(features[0])
+
+    # Stage 1 ... 7 theo phân nhóm MBConv
+    stages["1_MBConv1_k3x3_1x"] = prunable_layers_of(features[1])  # repeat=1
+    stages["2_MBConv6_k3x3_2x"] = prunable_layers_of(torchvision.ops.misc.Sequential(*[features[2], features[3]]))
+    stages["3_MBConv6_k5x5_2x"] = prunable_layers_of(torchvision.ops.misc.Sequential(*[features[4], features[5]]))
+    stages["4_MBConv6_k3x3_3x"] = prunable_layers_of(torchvision.ops.misc.Sequential(*[features[6], features[7], features[8]]))
+    stages["5_MBConv6_k5x5_3x"] = prunable_layers_of(torchvision.ops.misc.Sequential(*[features[9], features[10], features[11]]))
+    stages["6_MBConv6_k5x5_4x"] = prunable_layers_of(torchvision.ops.misc.Sequential(*[features[12], features[13], features[14], features[15]]))
+    stages["7_MBConv6_k3x3_1x"] = prunable_layers_of(features[16])
+
+    # Stage 8: Head Conv1x1
+    stages["8_Head_Conv1x1"] = prunable_layers_of(features[17])
+
+    # Stage 9: Pooling & FC
+    # avgpool không prune kênh, nhưng Linear có thể prune
+    head_layers = []
+    if hasattr(effnet, "avgpool") and isinstance(effnet.avgpool, nn.AdaptiveAvgPool2d):
+        pass  # Không có Conv/Linear
+    if hasattr(effnet, "classifier"):
+        for m in effnet.classifier.modules():
+            if isinstance(m, nn.Linear):
+                head_layers.append(m)
+    stages["9_Pooling_FC"] = head_layers
+
+    return stages
+
+
+# =========================
+# Build pruner theo stage
+# =========================
+def build_pruner_for_stage(model, stage_layers, prune_ratio, example_inputs, importance=None):
+    """
+    Xây pruner với ignored_layers = toàn bộ layer prunable trừ những layer thuộc stage này.
+    """
+    effnet = get_effnet_core(model)
+
+    # Toàn bộ module prunable (Conv/Linear) trong mô hình
+    all_prunable = []
+    for m in effnet.modules():
+        if isinstance(m, (nn.Conv2d, nn.Linear)):
+            all_prunable.append(m)
+
+    # Xác định ignored_layers = các module KHÔNG thuộc stage hiện tại
+    target_set = set(stage_layers)
+    ignored_layers = [m for m in all_prunable if m not in target_set]
+
+    if importance is None:
+        importance = tp.importance.MagnitudeImportance()
+
+    pruner = tp.pruner.MagnitudePruner(
+        model,
+        example_inputs=example_inputs,
+        importance=importance,
+        ch_sparsity=prune_ratio,
+        ignored_layers=ignored_layers
+    )
+    return pruner
+
+
+# =========================
+# Fine-tune helper
+# =========================
+def fine_tune(model, train_loader, epochs=5, lr=1e-3):
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    criterion = nn.CrossEntropyLoss()
+    model.train()
+    for epoch in range(epochs):
+        running_loss = 0.0
+        for inputs, targets in tqdm(train_loader, desc=f"Fine-tune epoch {epoch+1}/{epochs}", leave=False):
+            inputs, targets = inputs.to(device), targets.to(device)
+            optimizer.zero_grad()
+            outputs = model(inputs)
+            loss = criterion(outputs, targets)
+            loss.backward()
+            optimizer.step()
+            running_loss += loss.item()
+    return model
+
+
+# =========================
+# Main chạy stage-wise pruning
+# =========================
+def run_stagewise_pruning():
+    log_csv = OUT_DIR / "stagewise_prune_log.csv"
+    sens_csv = OUT_DIR / "stage_sensitivity.csv"
+    fig_path = OUT_DIR / "accuracy_vs_prune_ratio.png"
+    models_dir = OUT_DIR / "models_pruned"
+    models_dir.mkdir(exist_ok=True, parents=True)
+
+    # Ghi header cho CSV
+    with open(log_csv, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(["stage", "ratio", "test_acc", "delta_acc", "flops", "params", "model_size_MB"])
+
+    # Lấy baseline FLOPs/Params/Size (không prune)
+    # (Có thể giúp kiểm chứng sau)
+    # baseline_model = torch.load(MODEL_PATH, map_location=device)
+    # baseline_model.to(device)
+    # baseline_flops, baseline_params, baseline_size = evaluate_model(baseline_model)
+
+    # Thu thập dữ liệu để vẽ
+    plot_data = {}  # stage -> list of (ratio, acc)
+
+    # Sensitivity accumulation: stage -> [delta_acc/ratio]
+    sens_data = {}
+
+    # Chạy qua từng stage
+    for stage_idx in range(10):
+        # Reload baseline model mỗi vòng stage
+        model = torch.load(MODEL_PATH, map_location=device)
+        model.to(device)
+        model.eval()
+
+        effnet = get_effnet_core(model)
+        stages = map_stages_efficientnet_b0(effnet)
+
+        # Stage name
+        stage_name = list(stages.keys())[stage_idx]
+        stage_layers = stages[stage_name]
+
+        print(f"\n====================")
+        print(f"Stage {stage_idx}: {stage_name} — {len(stage_layers)} prunable layer(s)")
+        print(f"====================")
+
+        plot_data[stage_name] = []
+        sens_data[stage_name] = []
+
+        for ratio in PRUNE_RATIOS:
+            # Reload baseline cho mỗi ratio để không tích lũy prune
+            model = torch.load(MODEL_PATH, map_location=device)
+            model.to(device)
+            model.eval()
+
+            # Xây pruner cho stage
+            example_inputs = torch.randn(1, 1, 100, 100).to(device)
+            pruner = build_pruner_for_stage(model, stage_layers, prune_ratio=ratio, example_inputs=example_inputs)
+
+            # (Tuỳ chọn) tích lũy gradient/importance nếu muốn:
+            # for inputs, targets in tqdm(train_loader, desc="Accumulate gradients", leave=False):
+            #     inputs, targets = inputs.to(device), targets.to(device)
+            #     pruner.accumulate_gradients(inputs, targets)
+
+            # Prune theo ratio
+            pruner.step()
+
+            # Fine-tune 5 epochs
+            model = fine_tune(model, train_loader, epochs=FINE_TUNE_EPOCHS, lr=LEARNING_RATE)
+
+            # Đánh giá test accuracy
+            test_acc = eval_accuracy(model, test_loader)
+            delta_acc = float(BASELINE_ACC - test_acc)  # ΔA_s(r_i) = A_baseline - A_after
+
+            # Tính FLOPs/Params/Size sau prune
+            flops, params, size_mb = evaluate_model(model)
+
+            # Ghi log
+            with open(log_csv, "a", newline="", encoding="utf-8") as f:
+                writer = csv.writer(f)
+                writer.writerow([stage_name, ratio, round(test_acc, 6), round(delta_acc, 6),
+                                 int(flops), int(params), round(size_mb, 4)])
+
+            # Lưu model pruned (tuỳ chọn)
+            save_name = f"{stage_name.replace(' ', '_')}_ratio_{ratio:.1f}.pth"
+            torch.save(model, models_dir / save_name)
+
+            # Lưu để vẽ & sensitivity
+            plot_data[stage_name].append((ratio, test_acc))
+            sens_data[stage_name].append(delta_acc / ratio if ratio > 0 else 0.0)
+
+            print(f"Stage {stage_name} | ratio={ratio:.1f} | test_acc={test_acc*100:.2f}% | Δacc={delta_acc*100:.2f}%")
+
+    # Tính sensitivity theo công thức: S_l = (1/N) sum_i ΔA_s(r_i)/r_i
+    with open(sens_csv, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(["stage", "sensitivity"])
+        for stage_name, vals in sens_data.items():
+            S_l = float(np.mean(vals)) if len(vals) > 0 else 0.0
+            writer.writerow([stage_name, round(S_l, 6)])
+            print(f"Sensitivity {stage_name}: {S_l:.6f}")
+
+    # Vẽ graph Accuracy vs Pruning Ratio cho tất cả stage
+    plt.figure(figsize=(12, 8))
+    for stage_name, pairs in plot_data.items():
+        pairs = sorted(pairs, key=lambda x: x[0])  # sort theo ratio
+        ratios = [p[0] for p in pairs]
+        accs = [p[1] for p in pairs]
+        plt.plot(ratios, accs, marker='o', label=stage_name)
+
+    plt.xlabel("Pruning Ratio")
+    plt.ylabel("Accuracy (Test)")
+    plt.title("Accuracy vs Pruning Ratio — Stage-wise Pruning (EfficientNet-B0)")
+    plt.grid(True, alpha=0.3)
+    plt.legend(loc="best", fontsize=9)
+    plt.tight_layout()
+    plt.savefig(fig_path, dpi=200)
+    plt.close()
+
+    print(f"\n✅ Hoàn thành. Log lưu tại: {log_csv}")
+    print(f"✅ Sensitivity per stage lưu tại: {sens_csv}")
+    print(f"✅ Biểu đồ Accuracy vs Pruning Ratio lưu tại: {fig_path}")
+
+
+if __name__ == "__main__":
+    run_stagewise_pruning()
