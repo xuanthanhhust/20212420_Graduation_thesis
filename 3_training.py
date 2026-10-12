@@ -1,7 +1,3 @@
-# HELLO THANHVERDA
-# ê thành ơi t ctrl c nha
-#ai bày m chạy 200 epooch đó 
-
 
 
 import torch
